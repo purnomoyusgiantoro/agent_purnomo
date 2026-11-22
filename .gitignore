@@ -1,0 +1,30 @@
+# Agent Orchestrator Logs & Runtime State
+.agent/logs/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build & Coverage Artifacts
+dist/
+build/
+.pytest_cache/
+coverage/
+*.egg-info/
+
+# Local Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# OS Files
+.DS_Store
+Thumbs.db
