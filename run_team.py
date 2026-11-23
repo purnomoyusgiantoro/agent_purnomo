@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 LOG_DIR = Path(".agent/logs")
 ROLE_FILES = {
@@ -48,7 +53,38 @@ AGENT_ADAPTERS: dict[str, dict[str, object]] = {
     "codex": {"extra_args": ["--full-auto"], "prompt_flag": ""},
 }
 
+SENSITIVE_ENV_EXACT = {
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+    "DOCKER_PASSWORD",
+    "SSH_AUTH_SOCK",
+}
+SENSITIVE_ENV_PREFIXES = ("AWS_", "AZURE_", "GCP_SERVICE_ACCOUNT")
+
+FATAL_LOG_PATTERNS = [
+    re.compile(
+        r"^\s*(?:Error|FATAL|Exception):\s*(?:RateLimitError|AuthenticationError|QuotaExceeded|ContextWindowExceededError)\b",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(
+        r"\b(?:insufficient_quota|invalid_api_key|exceeded your current quota|APIError:\s*(?:401|403|429|500|502|503))\b",
+        re.IGNORECASE,
+    ),
+]
+
 WINDOWS_ARG_CHAR_LIMIT = 8000
+
+
+@dataclass(frozen=True)
+class SpecSnapshot:
+    prd_bytes: bytes
+    prd_sha256: str
+    design_bytes: bytes | None
+    design_sha256: str | None
+    tasks_criteria: tuple[tuple[str, str], ...]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -110,6 +146,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-incomplete-tasks",
         action="store_true",
         help="Allow STATUS: PASS even if unchecked '- [ ]' items remain in TASKS.md.",
+    )
+    parser.add_argument(
+        "--strict-sandbox",
+        action="store_true",
+        help="Strip unrelated host credential env vars (GITHUB_TOKEN, AWS_*, etc.) from child agent processes.",
     )
     parser.add_argument(
         "--no-git",
@@ -186,6 +227,18 @@ def ensure_gitignore(gitignore_path: Path = Path(".gitignore")) -> None:
     gitignore_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
+def build_sanitized_env(strict_sandbox: bool = False, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build child process environment, stripping sensitive host credentials when strict_sandbox is enabled."""
+    env = dict(os.environ if base_env is None else base_env)
+    if not strict_sandbox:
+        return env
+    for key in list(env.keys()):
+        upper = key.upper()
+        if upper in SENSITIVE_ENV_EXACT or any(upper.startswith(prefix) for prefix in SENSITIVE_ENV_PREFIXES):
+            del env[key]
+    return env
+
+
 def resolve_agent_executable(agent_cmd: str) -> str:
     resolved = shutil.which(agent_cmd)
     if resolved is not None:
@@ -251,6 +304,23 @@ def validate_artifact(path: Path, phase_name: str, required_pattern: str | None 
             )
 
 
+def extract_all_criteria(tasks_path: Path) -> list[tuple[str, str]]:
+    """Return ordered list of (TASK-ID, criterion_text) across both '[ ]' and '[x]' checkboxes."""
+    if not tasks_path.is_file():
+        return []
+    current_task = "BACKLOG"
+    criteria: list[tuple[str, str]] = []
+    for raw_line in tasks_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        task_match = re.search(r"\b(TASK-\d+)\b", raw_line)
+        if raw_line.lstrip().startswith("#") and task_match:
+            current_task = task_match.group(1)
+            continue
+        item_match = re.match(r"^\s*-\s*\[[ xX]\]\s+(.+?)\s*$", raw_line)
+        if item_match:
+            criteria.append((current_task, item_match.group(1)))
+    return criteria
+
+
 def extract_unchecked_tasks(tasks_path: Path) -> list[str]:
     """Return unchecked '- [ ] ...' criteria tagged with their parent TASK-ID."""
     if not tasks_path.is_file():
@@ -266,6 +336,78 @@ def extract_unchecked_tasks(tasks_path: Path) -> list[str]:
         if item_match:
             unchecked.append(f"[{current_task}] {item_match.group(1)}")
     return unchecked
+
+
+def capture_spec_snapshot(
+    prd_path: Path = Path("PRD.md"),
+    design_path: Path = Path("DESIGN_SPEC.md"),
+    tasks_path: Path = Path("TASKS.md"),
+) -> SpecSnapshot:
+    """Capture cryptographic hashes of specs and frozen acceptance criteria before Phase 3."""
+    prd_bytes = prd_path.read_bytes()
+    prd_sha = hashlib.sha256(prd_bytes).hexdigest()
+
+    design_bytes: bytes | None = None
+    design_sha: str | None = None
+    if design_path.is_file():
+        design_bytes = design_path.read_bytes()
+        design_sha = hashlib.sha256(design_bytes).hexdigest()
+
+    criteria = tuple(extract_all_criteria(tasks_path))
+    return SpecSnapshot(
+        prd_bytes=prd_bytes,
+        prd_sha256=prd_sha,
+        design_bytes=design_bytes,
+        design_sha256=design_sha,
+        tasks_criteria=criteria,
+    )
+
+
+def enforce_spec_integrity(
+    snapshot: SpecSnapshot,
+    prd_path: Path = Path("PRD.md"),
+    design_path: Path = Path("DESIGN_SPEC.md"),
+    tasks_path: Path = Path("TASKS.md"),
+) -> list[str]:
+    """Restore tampered specs and re-insert any deleted acceptance criteria as unchecked."""
+    warnings: list[str] = []
+
+    current_prd_sha = hashlib.sha256(prd_path.read_bytes()).hexdigest() if prd_path.is_file() else ""
+    if current_prd_sha != snapshot.prd_sha256:
+        prd_path.write_bytes(snapshot.prd_bytes)
+        warnings.append("Restored tampered PRD.md to frozen Phase-1 snapshot.")
+
+    if snapshot.design_bytes is not None and snapshot.design_sha256 is not None:
+        current_design_sha = hashlib.sha256(design_path.read_bytes()).hexdigest() if design_path.is_file() else ""
+        if current_design_sha != snapshot.design_sha256:
+            design_path.write_bytes(snapshot.design_bytes)
+            warnings.append("Restored tampered DESIGN_SPEC.md to frozen Phase-2 snapshot.")
+
+    if snapshot.tasks_criteria:
+        current_set = set(extract_all_criteria(tasks_path))
+        missing = [pair for pair in snapshot.tasks_criteria if pair not in current_set]
+        if missing:
+            existing_text = tasks_path.read_text(encoding="utf-8", errors="replace").rstrip() if tasks_path.is_file() else "# Engineering Backlog"
+            grouped: dict[str, list[str]] = {}
+            for task_id, criterion in missing:
+                grouped.setdefault(task_id, []).append(criterion)
+
+            restored_blocks = [
+                existing_text,
+                "",
+                "## Restored Frozen Acceptance Criteria (Anti-Tamper Guard)",
+            ]
+            for task_id, items in grouped.items():
+                restored_blocks.append(f"### {task_id} (Restored)")
+                for item in items:
+                    restored_blocks.append(f"- [ ] {item}")
+
+            tasks_path.write_text("\n".join(restored_blocks) + "\n", encoding="utf-8")
+            warnings.append(f"Restored {len(missing)} deleted acceptance criteria back to TASKS.md as unchecked.")
+
+    for w in warnings:
+        print(f"=== [SECURITY/INTEGRITY WARN] {w} ===")
+    return warnings
 
 
 def extract_qa_defects(qa_path: Path) -> list[str]:
@@ -321,6 +463,42 @@ def build_programmer_prompt(
     return base + "\n\n=== FOCUSED RETRY CONTEXT (ITERATION " + str(iteration) + ") ===\n" + "\n\n".join(context_sections)
 
 
+def check_log_for_fatal_errors(log_text: str, phase_name: str, log_path: Path) -> None:
+    """Detect fatal CLI/API errors even if the subprocess exited with status 0."""
+    for pattern in FATAL_LOG_PATTERNS:
+        match = pattern.search(log_text)
+        if match:
+            raise SystemExit(
+                f"FATAL: Detected silent fatal CLI/API error in {phase_name} ({match.group(0).strip()}). See {log_path}"
+            )
+
+
+def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Kill the child process and all orphaned descendants/servers in its process group."""
+    pid = proc.pid
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
 def git_checkpoint(message: str, enabled: bool) -> None:
     if not enabled or shutil.which("git") is None:
         return
@@ -355,8 +533,10 @@ def run_agent(
     prompt: str,
     log_path: Path,
     timeout_sec: int,
+    phase_name: str = "phase",
     prompt_mode: str = "auto",
     extra_args_str: str = "",
+    strict_sandbox: bool = False,
 ) -> None:
     cmd, stdin_payload = build_agent_command(
         agent_cmd=agent_cmd,
@@ -365,43 +545,60 @@ def run_agent(
         prompt_mode=prompt_mode,
         extra_args_str=extra_args_str,
     )
-    collected: list[str] = []
-    try:
-        with subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE if stdin_payload is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        ) as proc:
-            if stdin_payload is not None and proc.stdin is not None:
-                try:
-                    proc.stdin.write(stdin_payload)
-                except BrokenPipeError:
-                    pass
-                finally:
-                    proc.stdin.close()
+    popen_kwargs: dict[str, object] = {
+        "stdin": subprocess.PIPE if stdin_payload is not None else None,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": build_sanitized_env(strict_sandbox=strict_sandbox),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
 
-            assert proc.stdout is not None
+    collected: list[str] = []
+    timed_out = threading.Event()
+
+    try:
+        with subprocess.Popen(cmd, **popen_kwargs) as proc:  # type: ignore[arg-type]
+            def _on_timeout() -> None:
+                timed_out.set()
+                terminate_process_tree(proc)
+
+            timer = threading.Timer(timeout_sec, _on_timeout)
+            timer.daemon = True
+            timer.start()
             try:
+                if stdin_payload is not None and proc.stdin is not None:
+                    try:
+                        proc.stdin.write(stdin_payload)
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        proc.stdin.close()
+
+                assert proc.stdout is not None
                 for line in proc.stdout:
                     sys.stdout.write(line)
                     sys.stdout.flush()
                     collected.append(line)
-                rc = proc.wait(timeout=timeout_sec)
-            except subprocess.TimeoutExpired as exc:
-                proc.kill()
-                proc.wait()
-                log_path.write_text("".join(collected), encoding="utf-8")
-                raise SystemExit(f"FATAL: Phase timed out after {timeout_sec}s. Partial log: {log_path}") from exc
+                rc = proc.wait()
+            finally:
+                timer.cancel()
+                terminate_process_tree(proc)
     except OSError as exc:
         raise SystemExit(f"FATAL: Failed to launch '{agent_cmd}': {exc}") from exc
 
-    log_path.write_text("".join(collected), encoding="utf-8")
+    full_log = "".join(collected)
+    log_path.write_text(full_log, encoding="utf-8")
+    if timed_out.is_set():
+        raise SystemExit(f"FATAL: {phase_name} timed out after {timeout_sec}s. Partial log: {log_path}")
     if rc != 0:
         raise SystemExit(f"FATAL: '{agent_cmd}' exited with status {rc}. See {log_path}")
+    check_log_for_fatal_errors(full_log, phase_name, log_path)
 
 
 def is_qa_pass(qa_path: Path) -> bool:
@@ -453,8 +650,10 @@ def execute_pipeline(args: argparse.Namespace) -> int:
             pm_prompt,
             LOG_DIR / "phase1.log",
             args.timeout,
+            "Phase 1",
             args.prompt_mode,
             args.agent_args,
+            args.strict_sandbox,
         )
         validate_artifact(Path("PRD.md"), "Phase 1", r"^#\s+")
         validate_artifact(Path("TASKS.md"), "Phase 1", r"TASK-\d+")
@@ -474,8 +673,10 @@ def execute_pipeline(args: argparse.Namespace) -> int:
             uiux_prompt,
             LOG_DIR / "phase2.log",
             args.timeout,
+            "Phase 2",
             args.prompt_mode,
             args.agent_args,
+            args.strict_sandbox,
         )
         validate_artifact(Path("DESIGN_SPEC.md"), "Phase 2", r"^#\s+")
         git_checkpoint("phase-2-design-spec", enable_git)
@@ -484,8 +685,11 @@ def execute_pipeline(args: argparse.Namespace) -> int:
     validate_artifact(Path("TASKS.md"), "Phase 3 precondition")
     validate_artifact(Path("DESIGN_SPEC.md"), "Phase 3 precondition")
 
-    qa_path = Path("QA_REPORT.md")
+    prd_path = Path("PRD.md")
     tasks_path = Path("TASKS.md")
+    design_path = Path("DESIGN_SPEC.md")
+    qa_path = Path("QA_REPORT.md")
+    spec_snapshot = capture_spec_snapshot(prd_path, design_path, tasks_path)
     iterations_run = 0
 
     for i in range(1, args.max_retries + 1):
@@ -506,9 +710,12 @@ def execute_pipeline(args: argparse.Namespace) -> int:
                 prog_prompt,
                 LOG_DIR / f"phase3_iter{i}.log",
                 args.timeout,
+                f"Phase 3 (Iteration {i})",
                 args.prompt_mode,
                 args.agent_args,
+                args.strict_sandbox,
             )
+            enforce_spec_integrity(spec_snapshot, prd_path, design_path, tasks_path)
             git_checkpoint(f"phase-3-iter-{i}", enable_git)
 
         # Archive stale QA_REPORT.md before Phase 4 so previous verdicts cannot leak
@@ -528,8 +735,10 @@ def execute_pipeline(args: argparse.Namespace) -> int:
             qc_prompt,
             LOG_DIR / f"phase4_iter{i}.log",
             args.timeout,
+            f"Phase 4 (Iteration {i})",
             args.prompt_mode,
             args.agent_args,
+            args.strict_sandbox,
         )
         validate_artifact(qa_path, f"Phase 4 (Iteration {i})", r"^STATUS:\s*(PASS|FAIL)\s*$")
 
@@ -548,7 +757,7 @@ def execute_pipeline(args: argparse.Namespace) -> int:
         git_checkpoint(f"phase-4-iter-{i}", enable_git)
 
         if qa_ok:
-            print(f"=== [SUCCESS] Passed QC and Backlog Gate on iteration {i}! ===")
+            print(f"=== [SUCCESS] Passed QC, Spec Integrity, and Backlog Gate on iteration {i}! ===")
             print_summary(True, iterations_run)
             return 0
 

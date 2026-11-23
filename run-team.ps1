@@ -165,6 +165,41 @@ try {
         return @(Get-Content -Path "TASKS.md" -Encoding UTF8 | Where-Object { $_ -match '^\s*-\s*\[\s\]\s+' })
     }
 
+    function Get-TotalCriteriaCount {
+        if (-not (Test-Path "TASKS.md")) {
+            return 0
+        }
+        return @(Get-Content -Path "TASKS.md" -Encoding UTF8 | Where-Object { $_ -match '^\s*-\s*\[[ xX]\]\s+' }).Count
+    }
+
+    function Capture-FrozenSpecs {
+        Copy-Item -Force "PRD.md" "$LogDir/PRD.frozen.md"
+        Copy-Item -Force "DESIGN_SPEC.md" "$LogDir/DESIGN_SPEC.frozen.md"
+        Copy-Item -Force "TASKS.md" "$LogDir/TASKS.frozen.md"
+        return @{
+            PrdHash = (Get-FileHash "PRD.md" -Algorithm SHA256).Hash
+            DesignHash = (Get-FileHash "DESIGN_SPEC.md" -Algorithm SHA256).Hash
+            TotalCriteria = Get-TotalCriteriaCount
+        }
+    }
+
+    function Enforce-SpecIntegrity {
+        param([hashtable]$Snapshot)
+        if (-not (Test-Path "PRD.md") -or (Get-FileHash "PRD.md" -Algorithm SHA256).Hash -ne $Snapshot.PrdHash) {
+            Write-Host "=== [SECURITY/INTEGRITY WARN] Restoring tampered PRD.md to frozen Phase-1 snapshot ===" -ForegroundColor Yellow
+            Copy-Item -Force "$LogDir/PRD.frozen.md" "PRD.md"
+        }
+        if (-not (Test-Path "DESIGN_SPEC.md") -or (Get-FileHash "DESIGN_SPEC.md" -Algorithm SHA256).Hash -ne $Snapshot.DesignHash) {
+            Write-Host "=== [SECURITY/INTEGRITY WARN] Restoring tampered DESIGN_SPEC.md to frozen Phase-2 snapshot ===" -ForegroundColor Yellow
+            Copy-Item -Force "$LogDir/DESIGN_SPEC.frozen.md" "DESIGN_SPEC.md"
+        }
+        $curCount = Get-TotalCriteriaCount
+        if ($curCount -lt $Snapshot.TotalCriteria) {
+            Write-Host "=== [SECURITY/INTEGRITY WARN] Criteria count dropped ($curCount < $($Snapshot.TotalCriteria)) in TASKS.md! Restoring frozen TASKS.md ===" -ForegroundColor Yellow
+            Copy-Item -Force "$LogDir/TASKS.frozen.md" "TASKS.md"
+        }
+    }
+
     function Build-ProgrammerPrompt {
         param([int]$Iteration)
         $progRole = Get-Content -Raw -Encoding UTF8 ".agent/roles/programmer.md"
@@ -219,6 +254,10 @@ try {
         if ($exitCode -ne 0) {
             throw "Agent command '$AgentCmd' exited with code $exitCode. See $LogFile"
         }
+        $logBody = Get-Content -Raw -Encoding UTF8 $LogFile -ErrorAction SilentlyContinue
+        if ($logBody -match '(insufficient_quota|invalid_api_key|exceeded your current quota|(?m)^\s*(Error|FATAL|Exception):\s*(RateLimitError|AuthenticationError|QuotaExceeded))') {
+            throw "FATAL: Detected silent fatal CLI/API error in $LogFile"
+        }
     }
 
     if ($ResumeFrom -eq "phase1") {
@@ -241,6 +280,7 @@ try {
     }
 
     Assert-NonEmptyArtifacts -PhaseName "Phase 3 precondition" -Paths @("PRD.md", "TASKS.md", "DESIGN_SPEC.md")
+    $specSnapshot = Capture-FrozenSpecs
 
     for ($i = 1; $i -le $MaxRetries; $i++) {
         if ($i -eq 1 -and $ResumeFrom -eq "phase4") {
@@ -249,6 +289,7 @@ try {
             Write-Host "=== [PHASE 3 - Iteration $i/$MaxRetries] Programmer -> Implementation & Build ===" -ForegroundColor Cyan
             $progPrompt = Build-ProgrammerPrompt -Iteration $i
             Invoke-AgentStep -LogFile "$LogDir/phase3_iter$i.log" -PromptText $progPrompt
+            Enforce-SpecIntegrity -Snapshot $specSnapshot
             Invoke-GitCheckpoint -Message "phase-3-iter-$i"
         }
 
@@ -278,7 +319,7 @@ try {
         Invoke-GitCheckpoint -Message "phase-4-iter-$i"
 
         if ($qaOk) {
-            Write-Host "=== [SUCCESS] Passed QC and Backlog Gate on iteration $i! ===" -ForegroundColor Green
+            Write-Host "=== [SUCCESS] Passed QC, Spec Integrity, and Backlog Gate on iteration $i! ===" -ForegroundColor Green
             exit 0
         }
 

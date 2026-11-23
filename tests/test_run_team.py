@@ -11,8 +11,8 @@ if str(ROOT) not in sys.path:
 import run_team  # noqa: E402
 
 
-MOCK_AGENT_SCRIPT = r"""import os
-import sys
+MOCK_AGENT_SCRIPT = r"""import sys
+import time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -25,6 +25,10 @@ if "-p" in args:
         prompt = sys.stdin.read()
 else:
     prompt = sys.stdin.read()
+
+if "SLEEP_FOREVER" in prompt:
+    time.sleep(10)
+    sys.exit(0)
 
 if "Senior Technical Project Manager" in prompt:
     Path("PRD.md").write_text("# PRD\n\n## 1. Executive Summary\nMock PRD\n", encoding="utf-8")
@@ -71,6 +75,19 @@ else:
 """
 
 
+def _write_mock_wrapper(tmp_path: Path) -> Path:
+    mock_agent = tmp_path / "mock_agent.py"
+    mock_agent.write_text(MOCK_AGENT_SCRIPT, encoding="utf-8")
+    if os.name == "nt":
+        wrapper = tmp_path / "mock-agy.cmd"
+        wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{mock_agent}" %*\r\n', encoding="utf-8")
+    else:
+        wrapper = tmp_path / "mock-agy"
+        wrapper.write_text(f'#!/usr/bin/env bash\n"{sys.executable}" "{mock_agent}" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+    return wrapper
+
+
 class RunTeamUnitTests(unittest.TestCase):
     def test_is_qa_pass_strict_last_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,6 +116,62 @@ class RunTeamUnitTests(unittest.TestCase):
             defects = run_team.extract_qa_defects(qa)
             self.assertIn("### BUG-01: Crash", defects)
             self.assertTrue(any("CRITICAL" in line for line in defects))
+
+    def test_spec_snapshot_and_anti_tamper_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp)
+            prd = p / "PRD.md"
+            design = p / "DESIGN_SPEC.md"
+            tasks = p / "TASKS.md"
+
+            original_prd = "# PRD\n\nKeep auth guard\n"
+            original_design = "# Design\n\nBlue #38BDF8\n"
+            prd.write_text(original_prd, encoding="utf-8")
+            design.write_text(original_design, encoding="utf-8")
+            tasks.write_text(
+                "# Tasks\n### TASK-01: Auth\n- [ ] Add JWT guard\n- [ ] Verify 401\n",
+                encoding="utf-8",
+            )
+
+            snap = run_team.capture_spec_snapshot(prd, design, tasks)
+
+            # Simulate programmer tampering: overwriting specs & deleting a checkbox
+            prd.write_text("# PRD\n\nRemoved auth\n", encoding="utf-8")
+            design.write_text("# Design\n\nChanged\n", encoding="utf-8")
+            tasks.write_text("# Tasks\n### TASK-01: Auth\n- [x] Add JWT guard\n", encoding="utf-8")
+
+            warnings = run_team.enforce_spec_integrity(snap, prd, design, tasks)
+            self.assertEqual(len(warnings), 3)
+            self.assertEqual(prd.read_text(encoding="utf-8"), original_prd)
+            self.assertEqual(design.read_text(encoding="utf-8"), original_design)
+            self.assertEqual(run_team.extract_unchecked_tasks(tasks), ["[TASK-01] Verify 401"])
+
+    def test_silent_fatal_log_detector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "phase.log"
+            run_team.check_log_for_fatal_errors("All tests passed cleanly.\n", "Phase 3", log)
+            with self.assertRaises(SystemExit):
+                run_team.check_log_for_fatal_errors("Error: RateLimitError - 429 too many requests\n", "Phase 3", log)
+            with self.assertRaises(SystemExit):
+                run_team.check_log_for_fatal_errors("Provider returned insufficient_quota", "Phase 1", log)
+
+    def test_build_sanitized_env_strict_sandbox(self) -> None:
+        sample = {
+            "PATH": "/usr/bin",
+            "GITHUB_TOKEN": "ghp_secret",
+            "AWS_SECRET_ACCESS_KEY": "aws_secret",
+            "AZURE_CLIENT_SECRET": "az_secret",
+            "OPENAI_API_KEY": "keep_for_cli",
+        }
+        relaxed = run_team.build_sanitized_env(strict_sandbox=False, base_env=sample)
+        self.assertIn("GITHUB_TOKEN", relaxed)
+
+        strict = run_team.build_sanitized_env(strict_sandbox=True, base_env=sample)
+        self.assertNotIn("GITHUB_TOKEN", strict)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", strict)
+        self.assertNotIn("AZURE_CLIENT_SECRET", strict)
+        self.assertIn("PATH", strict)
+        self.assertIn("OPENAI_API_KEY", strict)
 
     def test_ensure_gitignore_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,6 +217,23 @@ class RunTeamUnitTests(unittest.TestCase):
             missing.write_text("# Valid Heading\n", encoding="utf-8")
             run_team.validate_artifact(missing, "Phase 1", r"^#\s+")
 
+    def test_run_agent_timeout_terminates_process_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            wrapper = _write_mock_wrapper(tmp_path)
+            log_file = tmp_path / "timeout.log"
+            with self.assertRaises(SystemExit) as ctx:
+                run_team.run_agent(
+                    agent_cmd=str(wrapper),
+                    resolved_executable=str(wrapper),
+                    prompt="SLEEP_FOREVER",
+                    log_path=log_file,
+                    timeout_sec=1,
+                    phase_name="TimeoutTest",
+                    prompt_mode="stdin",
+                )
+            self.assertIn("timed out after 1s", str(ctx.exception))
+
     def test_target_dir_bootstrap_and_end_to_end_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -156,18 +246,7 @@ class RunTeamUnitTests(unittest.TestCase):
             (template_dir / ".agent" / "roles" / "qc.md").write_text("Lead QA Automation Engineer", encoding="utf-8")
             (template_dir / ".agent" / "workflows" / "dev-team.md").write_text("workflow", encoding="utf-8")
 
-            mock_agent = tmp_path / "mock_agent.py"
-            mock_agent.write_text(MOCK_AGENT_SCRIPT, encoding="utf-8")
-
-            # Create cross-platform wrapper executable for mock agent
-            if os.name == "nt":
-                wrapper = tmp_path / "mock-agy.cmd"
-                wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{mock_agent}" %*\r\n', encoding="utf-8")
-            else:
-                wrapper = tmp_path / "mock-agy"
-                wrapper.write_text(f'#!/usr/bin/env bash\n"{sys.executable}" "{mock_agent}" "$@"\n', encoding="utf-8")
-                wrapper.chmod(0o755)
-
+            wrapper = _write_mock_wrapper(tmp_path)
             target_project = tmp_path / "new_project"
             orig_cwd = Path.cwd()
             try:
@@ -180,6 +259,7 @@ class RunTeamUnitTests(unittest.TestCase):
                         str(wrapper),
                         "--max-retries",
                         "3",
+                        "--strict-sandbox",
                         "--no-git",
                         "Build a mock app",
                     ]

@@ -196,6 +196,38 @@ count_unchecked_tasks() {
   grep -cE '^[[:space:]]*-[[:space:]]*\[[[:space:]]\]' TASKS.md || true
 }
 
+count_total_criteria() {
+  if [[ ! -s TASKS.md ]]; then
+    echo 0
+    return 0
+  fi
+  grep -cE '^[[:space:]]*-[[:space:]]*\[[ xX]\]' TASKS.md || true
+}
+
+freeze_specs() {
+  cp PRD.md "$LOG_DIR/PRD.frozen.md"
+  cp DESIGN_SPEC.md "$LOG_DIR/DESIGN_SPEC.frozen.md"
+  cp TASKS.md "$LOG_DIR/TASKS.frozen.md"
+  FROZEN_CRITERIA_COUNT="$(count_total_criteria)"
+}
+
+enforce_spec_integrity() {
+  if ! cmp -s PRD.md "$LOG_DIR/PRD.frozen.md" 2>/dev/null; then
+    echo "=== [SECURITY/INTEGRITY WARN] Restoring tampered PRD.md to frozen Phase-1 snapshot ==="
+    cp "$LOG_DIR/PRD.frozen.md" PRD.md
+  fi
+  if ! cmp -s DESIGN_SPEC.md "$LOG_DIR/DESIGN_SPEC.frozen.md" 2>/dev/null; then
+    echo "=== [SECURITY/INTEGRITY WARN] Restoring tampered DESIGN_SPEC.md to frozen Phase-2 snapshot ==="
+    cp "$LOG_DIR/DESIGN_SPEC.frozen.md" DESIGN_SPEC.md
+  fi
+  local cur_count
+  cur_count="$(count_total_criteria)"
+  if [[ "$cur_count" -lt "$FROZEN_CRITERIA_COUNT" ]]; then
+    echo "=== [SECURITY/INTEGRITY WARN] Criteria count dropped ($cur_count < $FROZEN_CRITERIA_COUNT) in TASKS.md! Restoring frozen TASKS.md ==="
+    cp "$LOG_DIR/TASKS.frozen.md" TASKS.md
+  fi
+}
+
 build_programmer_prompt() {
   local iter="$1"
   local base_prompt
@@ -234,7 +266,15 @@ run_agent() {
   local log_file="$1"
   local prompt_text="$2"
   "$AGENT_CMD" -p "$prompt_text" 2>&1 | tee "$log_file"
-  return "${PIPESTATUS[0]}"
+  local rc="${PIPESTATUS[0]}"
+  if [[ "$rc" -ne 0 ]]; then
+    return "$rc"
+  fi
+  if grep -qE '(insufficient_quota|invalid_api_key|exceeded your current quota|^(Error|FATAL|Exception):[[:space:]]*(RateLimitError|AuthenticationError|QuotaExceeded))' "$log_file"; then
+    echo "FATAL: Detected silent fatal CLI/API error in $log_file" >&2
+    return 1
+  fi
+  return 0
 }
 
 if [[ "$RESUME_FROM" == "phase1" ]]; then
@@ -260,6 +300,7 @@ Read ./PRD.md and ./TASKS.md from the current directory and generate ./DESIGN_SP
 fi
 
 require_non_empty "Phase 3 precondition" PRD.md TASKS.md DESIGN_SPEC.md
+freeze_specs
 
 for i in $(seq 1 "$MAX_RETRIES"); do
   if [[ "$i" -eq 1 && "$RESUME_FROM" == "phase4" ]]; then
@@ -268,6 +309,7 @@ for i in $(seq 1 "$MAX_RETRIES"); do
     echo "=== [PHASE 3 - Iteration $i/$MAX_RETRIES] Programmer -> Implementation & Build ==="
     PROG_PROMPT="$(build_programmer_prompt "$i")"
     run_agent "$LOG_DIR/phase3_iter${i}.log" "$PROG_PROMPT"
+    enforce_spec_integrity
     git_checkpoint "phase-3-iter-${i}"
   fi
 
@@ -298,7 +340,7 @@ Read ./PRD.md, ./TASKS.md, and ./DESIGN_SPEC.md. Write and run automated tests s
   git_checkpoint "phase-4-iter-${i}"
 
   if [[ "$QA_OK" == true ]]; then
-    echo "=== [SUCCESS] Passed QC and Backlog Gate on iteration $i! ==="
+    echo "=== [SUCCESS] Passed QC, Spec Integrity, and Backlog Gate on iteration $i! ==="
     exit 0
   fi
 
