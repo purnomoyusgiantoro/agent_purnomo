@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run orchestrator unit tests
+        run: python -W error -m unittest discover -s tests -v
+
+      - name: Check Bash runner syntax (Linux)
+        if: runner.os == 'Linux'
+        run: bash -n run-team.sh
+
+      - name: Check PowerShell runner syntax (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/run-team.ps1", [ref]$null, [ref]$errs) | Out-Null
+          if ($errs.Count -gt 0) { $errs; exit 1 }

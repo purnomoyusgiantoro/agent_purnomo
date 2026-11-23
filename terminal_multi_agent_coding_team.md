@@ -1,6 +1,6 @@
 # Terminal Multi-Agent Coding Team (PM, UI/UX, Programmer, QC Tester)
 
-Panduan lengkap ini berisi seluruh konfigurasi *role*, orkestrator, dan *script* eksekusi untuk menjalankan tim agen *coding* otonom di lingkungan terminal CLI agent (seperti Antigravity `agy` CLI atau terminal agent lainnya) dengan kontrak artefak berbasis disk, validasi *gate* antar-fase, checkpoint Git otomatis, dan verifikasi *build/test* nyata.
+Panduan lengkap ini berisi seluruh konfigurasi *role*, orkestrator, unit test, dan *script* eksekusi untuk menjalankan tim agen *coding* otonom di lingkungan terminal CLI agent (`agy`, `claude`, `gemini`, `codex`) dengan kontrak artefak berbasis disk, validasi *gate* antar-fase, checkpoint Git otomatis, dan verifikasi *build/test* nyata.
 
 ---
 
@@ -9,6 +9,9 @@ Panduan lengkap ini berisi seluruh konfigurasi *role*, orkestrator, dan *script*
 ```text
 agent_purnomo/
 ├── .gitignore
+├── .github/
+│   └── workflows/
+│       └── ci.yml           # GitHub Actions CI (Linux + Windows unittest & syntax checks)
 ├── .agent/
 │   ├── roles/
 │   │   ├── pm.md            # Senior Technical PM -> PRD.md & TASKS.md (dengan template skema)
@@ -20,7 +23,9 @@ agent_purnomo/
 │   └── logs/                # (Auto-generated & gitignored) Log eksekusi & arsip QA_REPORT
 ├── examples/
 │   └── sample-output/       # Contoh referensi output PRD, TASKS, DESIGN_SPEC, QA_REPORT
-├── run_team.py              # Orchestrator Python 3 cross-platform (Windows/macOS/Linux)
+├── tests/
+│   └── test_run_team.py     # Zero-dependency unittest suite untuk orchestrator
+├── run_team.py              # Orchestrator Python 3 cross-platform (direkomendasikan)
 ├── run-team.ps1             # Orchestrator native Windows PowerShell
 └── run-team.sh              # Orchestrator Bash (Linux/macOS/Git Bash)
 ```
@@ -29,57 +34,49 @@ agent_purnomo/
 
 ## 2. Peningkatan & Kontrak Orkestrasi
 
-Pipeline ini menerapkan proteksi rekayasa untuk mencegah kegagalan diam-diam (*silent failure*) saat dijalankan di proyek nyata:
-
-1. **Template Output Terstruktur**: Setiap file di `.agent/roles/` menyertakan *Required Output Template* sehingga struktur `PRD.md`, `TASKS.md`, `DESIGN_SPEC.md`, dan `QA_REPORT.md` konsisten antar-fase.
-2. **Artifact Validation Gates**: Script runner selalu memverifikasi bahwa file artefak fase sebelumnya benar-benar ada dan tidak kosong sebelum melanjutkan ke fase berikutnya.
-3. **Proteksi Stale `QA_REPORT.md`**: Sebelum Phase 4 dijalankan pada tiap iterasi, `QA_REPORT.md` lama otomatis diarsipkan ke `.agent/logs/` agar baris `STATUS: PASS` lama tidak menyebabkan *false positive*.
-4. **Verdict Matching Ketat**: Runner hanya menerima status lulus jika baris non-kosong terakhir dari `QA_REPORT.md` persis `STATUS: PASS`.
-5. **Progres Task & Defect-First**: `programmer.md` memprioritaskan perbaikan bug `CRITICAL`/`MAJOR` dari `QA_REPORT.md` terlebih dahulu, lalu mencentang `- [x]` pada `TASKS.md` setiap tugas terverifikasi.
-6. **Safe Process & Port Cleanup**: `qc.md` mengutamakan *in-process test client* (`TestClient`, `supertest`, `pytest`, `vitest`) atau mewajibkan *timeout* dan `trap` cleanup PID agar server tidak pernah menggantung atau membocorkan port.
-7. **Git Checkpoint Otomatis**: Setiap fase dan iterasi otomatis di-commit sebagai checkpoint (`--no-git` untuk menonaktifkan) serta seluruh stdout/stderr dicatat di `.agent/logs/`.
+1. **Bootstrap Proyek Target (`--target-dir` / `-TargetDir`)**: Jalankan pipeline dari repo pusat menuju folder proyek baru mana pun; `.agent/` dan `.gitignore` otomatis di-*scaffold* bila belum ada.
+2. **Adapter Multi-CLI & Auto-Stdin Fallback (`--prompt-mode`)**: Mendukung adapter otomatis untuk `agy`, `claude` (`--dangerously-skip-permissions`), `gemini`, dan `codex` (`--full-auto`), serta otomatis beralih ke pengiriman prompt via `stdin` pada Windows saat prompt melebihi 8.000 karakter atau melalui `.cmd`/`.bat` wrapper untuk mencegah error panjang command-line (`WinError 206`).
+3. **Focused Retry Prompt Injection**: Pada iterasi perbaikan (`i > 1`), daftar `BUG-XX` dari `QA_REPORT.md` dan checkbox `- [ ]` yang belum selesai di `TASKS.md` otomatis disuntikkan ke prompt Programmer.
+4. **Backlog Completion Gate**: `STATUS: PASS` dari `QA_REPORT.md` hanya diterima jika seluruh checkbox `- [ ]` di `TASKS.md` sudah dicentang `- [x]` (bisa di-*bypass* dengan `--allow-incomplete-tasks`).
+5. **Proteksi Stale `QA_REPORT.md` & Strict Verdict Matching**: Sebelum Phase 4, `QA_REPORT.md` lama diarsipkan ke `.agent/logs/` dan status lulus hanya valid jika baris non-kosong terakhir persis `STATUS: PASS`.
+6. **Auto-`.gitignore` Safety Guard sebelum `git add -A`**: Memastikan `.agent/logs/`, `.env`, `node_modules/`, `.venv/`, dan `*.db` selalu diabaikan sebelum checkpoint commit Git dibuat.
+7. **Safe Process & Port Cleanup**: `qc.md` mewajibkan *in-process test client* (`TestClient`, `supertest`, `pytest`, `vitest`) atau timeout + `trap` cleanup PID agar server uji tidak pernah menggantung.
 
 ---
 
 ## 3. Cara Menjalankan
 
 ### Opsi A: Mode Interaktif (`/dev-team` di dalam CLI Agent)
-Buka terminal di *root* proyekmu, jalankan CLI agent (`agy` atau terminal agent pilihanmu), lalu panggil *workflow*-nya:
-
 ```text
 /dev-team Buatkan aplikasi CLI & web dashboard monitoring harga crypto real-time. Override: gunakan Python FastAPI + SQLite untuk backend, React Tailwind untuk frontend.
 ```
 
 ### Opsi B: Cross-Platform Python Runner (`run_team.py`) — Direkomendasikan
-Berjalan identik di Windows, macOS, dan Linux tanpa dependensi eksternal (hanya Python 3):
-
 ```bash
-python run_team.py "Buat aplikasi web catatan keuangan pribadi dengan grafik pengeluaran bulanan"
-```
+# Jalankan langsung ke folder proyek target baru dari mana saja:
+python run_team.py --target-dir /path/to/proyek-baru "Buat aplikasi catatan keuangan pribadi"
 
-Opsi CLI yang tersedia:
-```bash
+# Dengan opsi lengkap (misal menggunakan Claude CLI):
 python run_team.py \
-  --agent agy \
+  --target-dir D:\Projek\task-app \
+  --agent claude \
+  --prompt-mode auto \
   --max-retries 3 \
-  --resume-from phase1 \
   --timeout 1800 \
   "Buat REST API manajemen tugas dengan FastAPI dan SQLite"
 ```
 
 ### Opsi C: Windows PowerShell (`run-team.ps1`)
 ```powershell
-.\run-team.ps1 -Idea "Buat REST API manajemen tugas" -AgentCmd "agy" -MaxRetries 3
-# Atau resume dari Phase 3 setelah edit manual:
-.\run-team.ps1 -ResumeFrom phase3
+.\run-team.ps1 -TargetDir "D:\Projek\task-app" -Idea "Buat REST API manajemen tugas" -AgentCmd "agy" -MaxRetries 3
+# Resume dari Phase 3:
+.\run-team.ps1 -TargetDir "D:\Projek\task-app" -ResumeFrom phase3
 ```
 
 ### Opsi D: Linux / macOS Bash (`run-team.sh`)
 ```bash
 chmod +x run-team.sh
-./run-team.sh --agent agy --max-retries 3 "Buat aplikasi web catatan keuangan pribadi"
-# Atau resume dari Phase 3:
-./run-team.sh --resume-from phase3
+./run-team.sh --target-dir ~/projects/task-app --agent agy --max-retries 3 "Buat aplikasi web catatan keuangan pribadi"
 ```
 
 ---
@@ -88,8 +85,20 @@ chmod +x run-team.sh
 
 | Flag (`run_team.py` / `run-team.sh`) | Parameter PowerShell (`run-team.ps1`) | Default | Fungsi |
 | :--- | :--- | :--- | :--- |
-| `--agent <cmd>` | `-AgentCmd <cmd>` | `agy` | Binary CLI agent (`agy`, `gemini`, `claude`, dll.) |
+| `--target-dir <dir>` | `-TargetDir <dir>` | *(CWD)* | Target folder proyek (auto-scaffold `.agent/` & `.gitignore`) |
+| `--agent <cmd>` | `-AgentCmd <cmd>` | `agy` | Binary CLI agent (`agy`, `claude`, `gemini`, `codex`) |
+| `--agent-args "<args>"` | *(Python only)* | `""` | Argumen tambahan yang diteruskan ke CLI agent |
+| `--prompt-mode <mode>` | `-PromptMode <mode>` | `auto` | Pengiriman prompt: `auto`, `arg`, atau `stdin` |
 | `--max-retries <n>` | `-MaxRetries <n>` | `3` | Batas maksimum iterasi loop Phase 3–4 |
 | `--resume-from <phase>` | `-ResumeFrom <phase>` | `phase1` | Lanjutkan dari `phase1`, `phase2`, `phase3`, atau `phase4` |
-| `--timeout <sec>` | *(Python only)* | `1800` | Batas waktu eksekusi per pemanggilan fase |
+| `--timeout <sec>` | *(Python only)* | `1800` | Batas waktu eksekusi per fase |
+| `--allow-incomplete-tasks` | `-AllowIncompleteTasks` | `false` | Izinkan `STATUS: PASS` walau masih ada `- [ ]` di `TASKS.md` |
 | `--no-git` | `-NoGit` | `false` | Nonaktifkan auto-init & checkpoint commit Git |
+
+---
+
+## 5. Menjalankan Unit Test Orchestrator
+
+```bash
+python -W error -m unittest discover -s tests -v
+```

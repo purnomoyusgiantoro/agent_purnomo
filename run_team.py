@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,8 +20,38 @@ ROLE_FILES = {
     "qc": Path(".agent/roles/qc.md"),
 }
 
+DEFAULT_GITIGNORE_ENTRIES = [
+    ".agent/logs/",
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "node_modules/",
+    "__pycache__/",
+    "*.py[cod]",
+    ".venv/",
+    "venv/",
+    "dist/",
+    "build/",
+    ".pytest_cache/",
+    "coverage/",
+    "*.db",
+    "*.sqlite",
+    "*.sqlite3",
+    ".DS_Store",
+    "Thumbs.db",
+]
 
-def parse_args() -> argparse.Namespace:
+AGENT_ADAPTERS: dict[str, dict[str, object]] = {
+    "agy": {"extra_args": [], "prompt_flag": "-p"},
+    "gemini": {"extra_args": [], "prompt_flag": "-p"},
+    "claude": {"extra_args": ["--dangerously-skip-permissions"], "prompt_flag": "-p"},
+    "codex": {"extra_args": ["--full-auto"], "prompt_flag": ""},
+}
+
+WINDOWS_ARG_CHAR_LIMIT = 8000
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the autonomous 4-agent coding team pipeline (PM -> UI/UX -> Programmer -> QC)."
     )
@@ -37,9 +68,25 @@ def parse_args() -> argparse.Namespace:
         help="Project idea or specification (alternative to positional argument).",
     )
     parser.add_argument(
+        "--target-dir",
+        default="",
+        help="Target project workspace directory. Scaffolds .agent/ and .gitignore automatically if missing.",
+    )
+    parser.add_argument(
         "--agent",
         default=os.environ.get("AGENT_CMD", "agy"),
         help="CLI agent binary to execute (default: agy or $AGENT_CMD).",
+    )
+    parser.add_argument(
+        "--agent-args",
+        default="",
+        help="Additional CLI arguments passed to the agent command (quoted string).",
+    )
+    parser.add_argument(
+        "--prompt-mode",
+        choices=["auto", "arg", "stdin"],
+        default="auto",
+        help="How prompts are delivered to the CLI agent (default: auto; switches to stdin on long Windows prompts).",
     )
     parser.add_argument(
         "--max-retries",
@@ -60,26 +107,137 @@ def parse_args() -> argparse.Namespace:
         help="Timeout in seconds per phase invocation (default: 1800).",
     )
     parser.add_argument(
+        "--allow-incomplete-tasks",
+        action="store_true",
+        help="Allow STATUS: PASS even if unchecked '- [ ]' items remain in TASKS.md.",
+    )
+    parser.add_argument(
         "--no-git",
         action="store_true",
         help="Disable automatic Git initialization and phase checkpoint commits.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.resolved_idea = (args.idea_flag or args.idea).strip()
     if args.max_retries < 1:
         parser.error("--max-retries must be >= 1")
+    if args.timeout < 1:
+        parser.error("--timeout must be >= 1")
     if args.resume_from == "phase1" and not args.resolved_idea:
         parser.error("A project idea is required when starting from phase1.")
     return args
 
 
-def ensure_prerequisites(agent_cmd: str) -> None:
+def resolve_template_root() -> Path:
+    """Locate the directory containing .agent/roles templates."""
+    cwd_roles = Path.cwd() / ".agent" / "roles"
+    if cwd_roles.is_dir():
+        return Path.cwd()
+    script_roles = Path(__file__).resolve().parent / ".agent" / "roles"
+    if script_roles.is_dir():
+        return Path(__file__).resolve().parent
+    return Path.cwd()
+
+
+def bootstrap_target_dir(target_dir: Path, template_root: Path) -> None:
+    """Create target_dir and copy missing .agent roles/workflows and .gitignore from template_root."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    src_agent = template_root / ".agent"
+    dst_agent = target_dir / ".agent"
+
+    for subdir in ("roles", "workflows"):
+        src_sub = src_agent / subdir
+        if src_sub.is_dir():
+            dst_sub = dst_agent / subdir
+            dst_sub.mkdir(parents=True, exist_ok=True)
+            for item in src_sub.iterdir():
+                if item.is_file():
+                    dst_item = dst_sub / item.name
+                    if not dst_item.exists():
+                        shutil.copy2(item, dst_item)
+
+    src_gitignore = template_root / ".gitignore"
+    dst_gitignore = target_dir / ".gitignore"
+    if src_gitignore.is_file() and not dst_gitignore.exists():
+        shutil.copy2(src_gitignore, dst_gitignore)
+    ensure_gitignore(dst_gitignore)
+
+
+def ensure_gitignore(gitignore_path: Path = Path(".gitignore")) -> None:
+    """Ensure critical ignore patterns exist before running git add -A."""
+    existing_text = ""
+    if gitignore_path.is_file():
+        existing_text = gitignore_path.read_text(encoding="utf-8", errors="replace")
+
+    existing_entries = {
+        line.strip()
+        for line in existing_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    missing = [entry for entry in DEFAULT_GITIGNORE_ENTRIES if entry not in existing_entries]
+    if not missing:
+        return
+
+    parts: list[str] = []
+    if existing_text:
+        parts.append(existing_text.rstrip("\n"))
+        parts.append("")
+    parts.append("# Added automatically by agent_purnomo safety guard")
+    parts.extend(missing)
+    gitignore_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
+def resolve_agent_executable(agent_cmd: str) -> str:
+    resolved = shutil.which(agent_cmd)
+    if resolved is not None:
+        return resolved
+    candidate = Path(agent_cmd)
+    if candidate.is_file():
+        return str(candidate)
+    raise SystemExit(f"FATAL: CLI command '{agent_cmd}' not found in PATH.")
+
+
+def ensure_prerequisites(agent_cmd: str) -> str:
     for role_name, path in ROLE_FILES.items():
         if not path.is_file() or path.stat().st_size == 0:
             raise SystemExit(f"FATAL: Missing or empty role file for '{role_name}': {path}")
-    if shutil.which(agent_cmd) is None:
-        raise SystemExit(f"FATAL: CLI command '{agent_cmd}' not found in PATH.")
+    resolved_cmd = resolve_agent_executable(agent_cmd)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return resolved_cmd
+
+
+def build_agent_command(
+    agent_cmd: str,
+    resolved_executable: str,
+    prompt: str,
+    prompt_mode: str = "auto",
+    extra_args_str: str = "",
+) -> tuple[list[str], str | None]:
+    """Build CLI command list and optional stdin payload using adapter rules."""
+    adapter_key = Path(agent_cmd).stem.lower()
+    adapter = AGENT_ADAPTERS.get(adapter_key, {"extra_args": [], "prompt_flag": "-p"})
+    adapter_args = list(adapter["extra_args"])  # type: ignore[arg-type]
+    prompt_flag = str(adapter["prompt_flag"])
+    user_args = shlex.split(extra_args_str) if extra_args_str.strip() else []
+    merged_args = adapter_args + user_args
+
+    effective_mode = prompt_mode
+    if effective_mode == "auto":
+        is_win_batch = os.name == "nt" and resolved_executable.lower().endswith((".cmd", ".bat"))
+        if (os.name == "nt" and len(prompt) > WINDOWS_ARG_CHAR_LIMIT) or (is_win_batch and "\n" in prompt) or not prompt_flag:
+            effective_mode = "stdin"
+        else:
+            effective_mode = "arg"
+
+    cmd = [resolved_executable, *merged_args]
+    if effective_mode == "stdin":
+        if adapter_key == "claude" and "-p" not in merged_args:
+            cmd.append("-p")
+        return cmd, prompt
+
+    if prompt_flag:
+        cmd.append(prompt_flag)
+    cmd.append(prompt)
+    return cmd, None
 
 
 def validate_artifact(path: Path, phase_name: str, required_pattern: str | None = None) -> None:
@@ -93,9 +251,80 @@ def validate_artifact(path: Path, phase_name: str, required_pattern: str | None 
             )
 
 
+def extract_unchecked_tasks(tasks_path: Path) -> list[str]:
+    """Return unchecked '- [ ] ...' criteria tagged with their parent TASK-ID."""
+    if not tasks_path.is_file():
+        return []
+    current_task = "BACKLOG"
+    unchecked: list[str] = []
+    for raw_line in tasks_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        task_match = re.search(r"\b(TASK-\d+)\b", raw_line)
+        if raw_line.lstrip().startswith("#") and task_match:
+            current_task = task_match.group(1)
+            continue
+        item_match = re.match(r"^\s*-\s*\[\s\]\s+(.+?)\s*$", raw_line)
+        if item_match:
+            unchecked.append(f"[{current_task}] {item_match.group(1)}")
+    return unchecked
+
+
+def extract_qa_defects(qa_path: Path) -> list[str]:
+    """Extract defect headings or severity lines from QA_REPORT.md for focused retry prompts."""
+    if not qa_path.is_file():
+        return []
+    lines = qa_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    defects: list[str] = []
+    in_bug = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^###\s+BUG-\d+", stripped):
+            in_bug = True
+            defects.append(stripped)
+        elif in_bug:
+            if stripped.startswith("## ") or stripped.startswith("STATUS:"):
+                in_bug = False
+            elif stripped:
+                defects.append(f"  {stripped}")
+        elif any(sev in stripped for sev in ("CRITICAL", "MAJOR")) and not stripped.startswith("*"):
+            defects.append(stripped)
+    return defects[:40]
+
+
+def build_programmer_prompt(
+    role_text: str,
+    iteration: int,
+    tasks_path: Path = Path("TASKS.md"),
+    qa_path: Path = Path("QA_REPORT.md"),
+) -> str:
+    base = (
+        f"{role_text}\n\n"
+        "Read ./PRD.md, ./TASKS.md, ./DESIGN_SPEC.md, and ./QA_REPORT.md (if present). "
+        "Implement pending tasks or fix logged bugs, update verified checkboxes in ./TASKS.md, "
+        "and verify build/typecheck in terminal."
+    )
+    if iteration <= 1 and not qa_path.is_file():
+        return base
+
+    context_sections: list[str] = []
+    defects = extract_qa_defects(qa_path)
+    if defects:
+        context_sections.append("ACTIVE QA DEFECTS TO FIX FIRST:\n" + "\n".join(defects))
+
+    unchecked = extract_unchecked_tasks(tasks_path)
+    if unchecked:
+        listed = "\n".join(f"- {item}" for item in unchecked[:25])
+        context_sections.append(f"REMAINING UNCHECKED ACCEPTANCE CRITERIA ({len(unchecked)}):\n{listed}")
+
+    if not context_sections:
+        return base
+
+    return base + "\n\n=== FOCUSED RETRY CONTEXT (ITERATION " + str(iteration) + ") ===\n" + "\n\n".join(context_sections)
+
+
 def git_checkpoint(message: str, enabled: bool) -> None:
     if not enabled or shutil.which("git") is None:
         return
+    ensure_gitignore(Path(".gitignore"))
     if not Path(".git").exists():
         subprocess.run(["git", "init", "-q"], check=False)
     subprocess.run(["git", "add", "-A"], check=False)
@@ -120,33 +349,55 @@ def git_checkpoint(message: str, enabled: bool) -> None:
     )
 
 
-def run_agent(agent_cmd: str, prompt: str, log_path: Path, timeout_sec: int) -> None:
-    cmd = [agent_cmd, "-p", prompt]
+def run_agent(
+    agent_cmd: str,
+    resolved_executable: str,
+    prompt: str,
+    log_path: Path,
+    timeout_sec: int,
+    prompt_mode: str = "auto",
+    extra_args_str: str = "",
+) -> None:
+    cmd, stdin_payload = build_agent_command(
+        agent_cmd=agent_cmd,
+        resolved_executable=resolved_executable,
+        prompt=prompt,
+        prompt_mode=prompt_mode,
+        extra_args_str=extra_args_str,
+    )
+    collected: list[str] = []
     try:
-        proc = subprocess.Popen(
+        with subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE if stdin_payload is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-        )
+        ) as proc:
+            if stdin_payload is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.write(stdin_payload)
+                except BrokenPipeError:
+                    pass
+                finally:
+                    proc.stdin.close()
+
+            assert proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    collected.append(line)
+                rc = proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired as exc:
+                proc.kill()
+                proc.wait()
+                log_path.write_text("".join(collected), encoding="utf-8")
+                raise SystemExit(f"FATAL: Phase timed out after {timeout_sec}s. Partial log: {log_path}") from exc
     except OSError as exc:
         raise SystemExit(f"FATAL: Failed to launch '{agent_cmd}': {exc}") from exc
-
-    collected: list[str] = []
-    assert proc.stdout is not None
-    try:
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            collected.append(line)
-        rc = proc.wait(timeout=timeout_sec)
-    except subprocess.TimeoutExpired as exc:
-        proc.kill()
-        proc.wait()
-        log_path.write_text("".join(collected), encoding="utf-8")
-        raise SystemExit(f"FATAL: Phase timed out after {timeout_sec}s. Partial log: {log_path}") from exc
 
     log_path.write_text("".join(collected), encoding="utf-8")
     if rc != 0:
@@ -162,6 +413,20 @@ def is_qa_pass(qa_path: Path) -> bool:
     return lines[-1] == "STATUS: PASS"
 
 
+def append_backlog_gate_failure(qa_path: Path, unchecked: list[str]) -> None:
+    """Downgrade a false PASS report when TASKS.md still contains unchecked acceptance criteria."""
+    existing = qa_path.read_text(encoding="utf-8", errors="replace").rstrip()
+    summary_items = "\n".join(f"- {item}" for item in unchecked[:20])
+    extra = (
+        "\n\n## Backlog Completion Gate Failure\n"
+        f"- **Severity:** `MAJOR`\n"
+        f"- **Detail:** {len(unchecked)} acceptance criteria remain unchecked (`- [ ]`) in `./TASKS.md`:\n"
+        f"{summary_items}\n\n"
+        "STATUS: FAIL\n"
+    )
+    qa_path.write_text(existing + extra, encoding="utf-8")
+
+
 def print_summary(passed: bool, iterations_run: int) -> None:
     print("\n=== [RELEASE SUMMARY] ===")
     print(f"Final Verdict : {'PASS' if passed else 'FAIL'}")
@@ -170,18 +435,27 @@ def print_summary(passed: bool, iterations_run: int) -> None:
         p = Path(artifact)
         status = f"{p.stat().st_size} bytes" if p.is_file() else "MISSING"
         print(f"  - {artifact}: {status}")
+    unfinished = extract_unchecked_tasks(Path("TASKS.md"))
+    print(f"Unchecked Tasks: {len(unfinished)}")
     print(f"Logs Directory: {LOG_DIR}")
 
 
-def main() -> int:
-    args = parse_args()
-    ensure_prerequisites(args.agent)
+def execute_pipeline(args: argparse.Namespace) -> int:
+    resolved_exec = ensure_prerequisites(args.agent)
     enable_git = not args.no_git
 
     if args.resume_from == "phase1":
         print("=== [PHASE 1] Project Manager -> PRD.md & TASKS.md ===")
         pm_prompt = f"{ROLE_FILES['pm'].read_text(encoding='utf-8')}\n\nUSER REQUEST:\n{args.resolved_idea}"
-        run_agent(args.agent, pm_prompt, LOG_DIR / "phase1.log", args.timeout)
+        run_agent(
+            args.agent,
+            resolved_exec,
+            pm_prompt,
+            LOG_DIR / "phase1.log",
+            args.timeout,
+            args.prompt_mode,
+            args.agent_args,
+        )
         validate_artifact(Path("PRD.md"), "Phase 1", r"^#\s+")
         validate_artifact(Path("TASKS.md"), "Phase 1", r"TASK-\d+")
         git_checkpoint("phase-1-prd-and-tasks", enable_git)
@@ -194,7 +468,15 @@ def main() -> int:
             f"{ROLE_FILES['uiux'].read_text(encoding='utf-8')}\n\n"
             "Read ./PRD.md and ./TASKS.md from the current directory and generate ./DESIGN_SPEC.md."
         )
-        run_agent(args.agent, uiux_prompt, LOG_DIR / "phase2.log", args.timeout)
+        run_agent(
+            args.agent,
+            resolved_exec,
+            uiux_prompt,
+            LOG_DIR / "phase2.log",
+            args.timeout,
+            args.prompt_mode,
+            args.agent_args,
+        )
         validate_artifact(Path("DESIGN_SPEC.md"), "Phase 2", r"^#\s+")
         git_checkpoint("phase-2-design-spec", enable_git)
 
@@ -203,6 +485,7 @@ def main() -> int:
     validate_artifact(Path("DESIGN_SPEC.md"), "Phase 3 precondition")
 
     qa_path = Path("QA_REPORT.md")
+    tasks_path = Path("TASKS.md")
     iterations_run = 0
 
     for i in range(1, args.max_retries + 1):
@@ -211,13 +494,21 @@ def main() -> int:
             print(f"=== [SKIP] Resuming directly at Phase 4 (Iteration {i}/{args.max_retries}) ===")
         else:
             print(f"=== [PHASE 3 - Iteration {i}/{args.max_retries}] Programmer -> Implementation & Build ===")
-            prog_prompt = (
-                f"{ROLE_FILES['programmer'].read_text(encoding='utf-8')}\n\n"
-                "Read ./PRD.md, ./TASKS.md, ./DESIGN_SPEC.md, and ./QA_REPORT.md (if present). "
-                "Implement pending tasks or fix logged bugs, update verified checkboxes in ./TASKS.md, "
-                "and verify build/typecheck in terminal."
+            prog_prompt = build_programmer_prompt(
+                role_text=ROLE_FILES["programmer"].read_text(encoding="utf-8"),
+                iteration=i,
+                tasks_path=tasks_path,
+                qa_path=qa_path,
             )
-            run_agent(args.agent, prog_prompt, LOG_DIR / f"phase3_iter{i}.log", args.timeout)
+            run_agent(
+                args.agent,
+                resolved_exec,
+                prog_prompt,
+                LOG_DIR / f"phase3_iter{i}.log",
+                args.timeout,
+                args.prompt_mode,
+                args.agent_args,
+            )
             git_checkpoint(f"phase-3-iter-{i}", enable_git)
 
         # Archive stale QA_REPORT.md before Phase 4 so previous verdicts cannot leak
@@ -231,21 +522,55 @@ def main() -> int:
             "Write and run automated tests safely in terminal (no hanging servers or leaked ports), "
             "then write a fresh ./QA_REPORT.md ending with STATUS: PASS or STATUS: FAIL."
         )
-        run_agent(args.agent, qc_prompt, LOG_DIR / f"phase4_iter{i}.log", args.timeout)
+        run_agent(
+            args.agent,
+            resolved_exec,
+            qc_prompt,
+            LOG_DIR / f"phase4_iter{i}.log",
+            args.timeout,
+            args.prompt_mode,
+            args.agent_args,
+        )
         validate_artifact(qa_path, f"Phase 4 (Iteration {i})", r"^STATUS:\s*(PASS|FAIL)\s*$")
+
+        qa_ok = is_qa_pass(qa_path)
+        if qa_ok:
+            unfinished = extract_unchecked_tasks(tasks_path)
+            if unfinished and not args.allow_incomplete_tasks:
+                print(
+                    f"=== [WARN] QA_REPORT.md returned STATUS: PASS, but {len(unfinished)} "
+                    "unchecked item(s) remain in TASKS.md! Routing back to Programmer... ==="
+                )
+                append_backlog_gate_failure(qa_path, unfinished)
+                qa_ok = False
+
         shutil.copy2(qa_path, LOG_DIR / f"QA_REPORT.iter{i}.md")
         git_checkpoint(f"phase-4-iter-{i}", enable_git)
 
-        if is_qa_pass(qa_path):
-            print(f"=== [SUCCESS] Passed QC on iteration {i}! ===")
+        if qa_ok:
+            print(f"=== [SUCCESS] Passed QC and Backlog Gate on iteration {i}! ===")
             print_summary(True, iterations_run)
             return 0
 
-        print(f"=== [FAIL] Defects logged in QA_REPORT.md on iteration {i}. Routing back to Programmer... ===")
+        print(f"=== [FAIL] Defects or unfinished tasks remain on iteration {i}. Routing back to Programmer... ===")
 
     print(f"=== [STOP] Reached max retries ({args.max_retries}). Inspect QA_REPORT.md and {LOG_DIR}/ ===")
     print_summary(False, iterations_run)
     return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    orig_cwd = Path.cwd()
+    if args.target_dir:
+        template_root = resolve_template_root()
+        target_path = Path(args.target_dir).resolve()
+        bootstrap_target_dir(target_path, template_root)
+        os.chdir(target_path)
+    try:
+        return execute_pipeline(args)
+    finally:
+        os.chdir(orig_cwd)
 
 
 if __name__ == "__main__":
